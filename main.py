@@ -1,54 +1,166 @@
-import shotstack_sdk as shotstack
-from shotstack_sdk.api import edit_api
-from shotstack_sdk.model import *
+# Import necessary libraries
+from langchain_google_genai import ChatGoogleGenerativeAI, HarmBlockThreshold, HarmCategory
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langgraph.graph import StateGraph, END, START
+from langgraph.checkpoint.memory import MemorySaver
+from typing import Annotated, Sequence
+from typing_extensions import TypedDict
+from termcolor import colored
+import os
+import shutil
+from datetime import datetime
 
-# Initialize Shotstack API
-API_KEY = "your_api_key_here"  # Replace with your Shotstack API Key
-configuration = shotstack.Configuration(host="https://api.shotstack.io/v1")
-configuration.api_key["x-api-key"] = API_KEY
+# Import provided agents
+from title_generator import title_generator
+from writter import writter_agent  # Assuming typo in 'writter'
+from image_gen import image_generator
 
-# Create an API client
-with shotstack.ApiClient(configuration) as api_client:
-    api_instance = edit_api.EditApi(api_client)
 
-    # Define Images
-    image1 = ImageAsset(src="https://your-image-url1.jpg")  # Replace with your image URL
-    image2 = ImageAsset(src="https://your-image-url2.jpg")
 
-    # Apply Effects (Zoom-in for Image 1)
-    clip1 = Clip(
-        asset=image1,
-        start=0.0,
-        length=3.0,  # Display for 3 seconds
-        effect="zoomInSlow"  # Apply zoom-in effect
-    )
+# Initialize the language model
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.0-flash",
+    safety_settings={
+        HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+    },
+    verbose=True  # Enable verbose output
+)
 
-    # Image 2 with blur transition
-    clip2 = Clip(
-        asset=image2,
-        start=3.0,  # Start after the first image
-        length=3.0,
-        transition=Transition(
-            _in="blur",  # Apply blur transition
-            out="blur"
-        )
-    )
+# Define the Writer chain
+writer_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a writer creating engaging Medium stories. Write the best article possible based on the given title. If critiques are provided, revise the article accordingly."),
+    MessagesPlaceholder(variable_name="messages"),
+])
+writer_chain = writer_prompt | llm
 
-    # Arrange clips in timeline
-    track1 = Track(clips=[clip1, clip2])
-    timeline = Timeline(tracks=[track1])
+# Define the Critic chain
+critic_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a critic reviewing a Medium story. Provide detailed feedback and suggestions for improvement. If the article is satisfactory, include 'NEXT' in your response."),
+    ("human", "Here is the article to review:\n{article}"),
+])
+critic_chain = critic_prompt | llm
 
-    # Output settings
-    output = Output(format="mp4", resolution="hd")
+# Define the state
+class State(TypedDict):
+    messages: Sequence[AIMessage | HumanMessage]  
+    iteration: int
 
-    # Create render request
-    edit = Edit(timeline=timeline, output=output)
+# Helper function to extract the latest article
+def get_last_article(messages):
+    for msg in reversed(messages):
+        if msg.type == "ai" and msg.content.startswith("Article:"):
+            return msg.content[len("Article: "):].strip()
+    return None
 
-    # Send request to render video
-    try:
-        response = api_instance.post_render(edit)
-        # Print Render ID
-        print(f"Render ID: {response.id}")
-        print("Check Shotstack Dashboard to view progress.")
-    except shotstack.ApiException as e:
-        print(f"An error occurred: {e}")
+# Node definitions
+async def title_generator_node(state: State) -> State:
+    print(colored("Generating title...", "yellow"))
+    title = title_generator()  # Call the provided title generator
+    print(colored(f"Title generated: {title}", "green"))
+    return {"messages": [AIMessage(content=f"Title: {title}")]}
+
+async def writer_node(state: State) -> State:
+    print(colored("Writing article...", "yellow"))
+    print(colored(str(state["messages"]), 'red', attrs=['bold']))
+    output = await writer_chain.ainvoke(state["messages"])
+    article = output.content.strip()
+    print(colored("Article written.", "green"))
+    # Preserve preexisting messages (including the title)
+    return {"messages": state["messages"] + [AIMessage(content=f"Article: {article}")]}
+
+async def critic_node(state: State) -> State:
+    print(colored("Critiquing article...", "yellow"))
+    article = get_last_article(state["messages"])
+    if not article:
+        raise ValueError("No article found in state")
+    critique = await critic_chain.ainvoke({"article": article})
+    print(colored("Critique generated.", "green"))
+    return {
+        "messages": state["messages"] + [HumanMessage(content=f"Critique: {critique.content}")],
+        "iteration": state["iteration"] + 1
+    }
+
+async def image_generator_node(state: State) -> State:
+    print(colored("Generating cover image...", "yellow"))
+    article = get_last_article(state["messages"])
+    if not article:
+        raise ValueError("No article found in state")
+    image_generator(article)  # call function; ignore any returned image path
+    print(colored("Cover image generated.", "green"))
+    return state
+
+async def save_node(state: State) -> State:
+    print(colored("Saving article...", "yellow"))
+    
+    # Extract title
+    title_msg = next((msg for msg in state["messages"] if msg.content.startswith("Title:")), None)
+    if not title_msg:
+        raise ValueError("Title not found")
+    title = title_msg.content[len("Title: "):].strip()
+    
+    # Extract article
+    article = get_last_article(state["messages"])
+    if not article:
+        raise ValueError("Article not found")
+    
+    # Create a new folder
+    folder_name = f"story_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(folder_name, exist_ok=True)
+    
+    # Save markdown file without cover image
+    md_content = f"# {title}\n\n{article}"
+    md_path = os.path.join(folder_name, "article.md")
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write(md_content)
+    
+    print(colored(f"Article saved to {md_path}", "green"))
+    return {}
+
+# Conditional routing after critic
+def route_after_critic(state: State) -> str:
+    last_critique = state["messages"][-1].content
+    if "NEXT" in last_critique or state["iteration"] >= 3:
+        print(colored("Critic satisfied or max iterations reached. Moving to image generation.", "cyan"))
+        return "image_generator"
+    print(colored("Critic suggests improvements. Returning to writer.", "cyan"))
+    return "writer"
+
+# Build the graph
+builder = StateGraph(State)
+builder.add_node("title_generator", title_generator_node)
+builder.add_node("writer", writer_node)
+builder.add_node("critic", critic_node)
+builder.add_node("image_generator", image_generator_node)
+builder.add_node("save", save_node)
+
+# Define edges
+builder.add_edge(START, "title_generator")
+builder.add_edge("title_generator", "writer")
+builder.add_edge("writer", "critic")
+builder.add_conditional_edges("critic", route_after_critic, {
+    "writer": "writer",
+    "image_generator": "image_generator"
+})
+builder.add_edge("image_generator", "save")
+builder.add_edge("save", END)
+
+# Compile the graph with memory
+memory = MemorySaver()
+graph = builder.compile(checkpointer=memory)
+
+# Run the graph
+async def main():
+    config = {"configurable": {"thread_id": "1"}}
+    initial_state = {
+        "messages": [HumanMessage(content="Generate a title for a Medium story")],
+        "iteration": 0
+    }
+    print(colored("Starting the story generation process...", "magenta"))
+    async for event in graph.astream(initial_state, config):
+        print(event)
+        print(colored("---", "blue"))
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
