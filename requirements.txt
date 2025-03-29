@@ -1,0 +1,9 @@
+langgraph
+termcolor
+pydantic
+langchain
+google.genai
+langchain_google_genai
+langchain_core 
+python-dotenv
+requests
