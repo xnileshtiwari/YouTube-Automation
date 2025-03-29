@@ -3,7 +3,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-GOOGLE_API_KEY = "AIzaSyApo8UsS6q3RutbGa0FMp01Msz5BBSrqU4"
 
 llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-pro-exp-03-25",
