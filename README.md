@@ -1,5 +1,3 @@
-## This is a youtube automation agent.
+# Current Functionalities
 
-# First BOXX
-
-the model will be creating json file here for the video editing after that being done we will be editing the video 
+1. Title(Idea generator) -> Writer -> <-Critic {if NEXT or n = 3} -> Notion (END)
